@@ -99,7 +99,8 @@ jobs:
           }
           function Has-UserPath {
             param([string] $Directory)
-            $entries = @((Read-UserPath -split ';') | ForEach-Object { $_.TrimEnd('\') })
+            $userPathValue = Read-UserPath
+            $entries = @(($userPathValue -split ';') | ForEach-Object { $_.TrimEnd('\') })
             return $entries -contains $Directory.TrimEnd('\')
           }
           function Get-InstalledExe {
@@ -134,6 +135,7 @@ jobs:
             $resolved = (Get-Command sing-box.exe -CommandType Application).Source
             $link = Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Links/sing-box.exe'
             if ($PathMode) {
+              Write-Host "Current user PATH: $(Read-UserPath)"
               if (-not (Has-UserPath $directory)) { throw "Expected real binary directory in PATH: $directory" }
               if ($resolved -ne $exe) { throw "Expected real EXE via PATH; got $resolved" }
               if (-not (Test-Path (Join-Path $directory 'libcronet.dll'))) { throw 'Missing libcronet.dll' }
