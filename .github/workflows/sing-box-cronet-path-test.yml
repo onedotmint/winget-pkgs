@@ -26,6 +26,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: manifests/s/SagerNet/sing-box/1.14.4
       - name: Prepare WinGet on disposable runner
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
