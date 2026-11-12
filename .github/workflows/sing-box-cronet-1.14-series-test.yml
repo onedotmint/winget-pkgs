@@ -1,0 +1,167 @@
+name: sing-box 1.14.x bundled DLL PATH regression
+
+on:
+  push:
+    branches: [test/sing-box-1.14-series-cronet-path]
+    paths: [.github/workflows/sing-box-cronet-1.14-series-test.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-and-check:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, fixed]
+        version: ['1.14.0', '1.14.1', '1.14.2', '1.14.3', '1.14.4']
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: manifests/s/SagerNet/sing-box
+      - name: Prepare WinGet on disposable runner
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Get-AppxPackage Microsoft.DesktopAppInstaller)) {
+            Install-Module Microsoft.WinGet.Client -Repository PSGallery -Scope CurrentUser -Force
+            Import-Module Microsoft.WinGet.Client
+            Repair-WinGetPackageManager -AllUsers -Force -Latest
+          }
+          $app = Get-AppxPackage Microsoft.DesktopAppInstaller
+          if (-not $app) { throw 'WinGet App Installer is unavailable' }
+          $winget = Join-Path $app.InstallLocation 'winget.exe'
+          & $winget --info
+          if ($LASTEXITCODE -ne 0) { throw 'winget --info failed' }
+          & $winget settings --enable LocalManifestFiles
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot enable local manifests' }
+          "WINGET_EXE=$winget" >> $env:GITHUB_ENV
+      - name: Validate, install and test command resolution and Cronet loading
+        env:
+          TEST_VARIANT: ${{ matrix.variant }}
+          TEST_VERSION: ${{ matrix.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = $env:TEST_VERSION
+          $manifest = Join-Path $env:GITHUB_WORKSPACE "manifests/s/SagerNet/sing-box/$version"
+          $installer = Join-Path $manifest 'SagerNet.sing-box.installer.yaml'
+          $variant = $env:TEST_VARIANT
+          $text = [IO.File]::ReadAllText($installer)
+          $text = $text -replace '(?m)^ArchiveBinariesDependOnPath: true\r?\n', ''
+          if ($variant -eq 'fixed') {
+            $anchor = 'NestedInstallerType: portable'
+            if (-not $text.Contains($anchor)) { throw 'Expected ZIP portable installer manifest' }
+            $text = $text.Replace($anchor, $anchor + "`r`nArchiveBinariesDependOnPath: true")
+          }
+          [IO.File]::WriteAllText($installer, $text, [Text.UTF8Encoding]::new($false))
+          Write-Output "Manifest under test ($version / $variant):"
+          Get-Content $installer
+          & $env:WINGET_EXE validate --manifest $manifest --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest validation failed' }
+          if (Get-Command sing-box.exe -ErrorAction SilentlyContinue) { throw 'Runner already contains sing-box' }
+          & $env:WINGET_EXE install --manifest $manifest --architecture x64 --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest installation failed' }
+
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $env:Path = "$machinePath;$userPath"
+          Write-Output "Persisted user PATH: $userPath"
+          $packageRoot = Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Packages'
+          $executables = @(Get-ChildItem $packageRoot -Filter sing-box.exe -Recurse -File)
+          if ($executables.Count -ne 1) { throw "Expected one real executable, found $($executables.Count)" }
+          $realExe = $executables[0].FullName
+          $realDir = Split-Path $realExe
+          if ($realDir -notlike "*sing-box-$version-windows-amd64") { throw "Wrong installed version or architecture: $realDir" }
+          $dll = Join-Path $realDir 'libcronet.dll'
+          if (-not (Test-Path $dll)) { throw 'libcronet.dll is absent from the installed package' }
+          $resolved = (Get-Command sing-box.exe -CommandType Application).Source
+          $where = @(where.exe sing-box.exe)
+          if ($LASTEXITCODE -ne 0) { throw 'where.exe did not resolve sing-box' }
+          Write-Output "Get-Command: $resolved"
+          Write-Output "where.exe: $($where -join '; ')"
+          Write-Output "Real executable: $realExe"
+          Write-Output "DLL SHA256: $((Get-FileHash $dll -Algorithm SHA256).Hash)"
+          $link = Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Links/sing-box.exe'
+          if ($variant -eq 'fixed') {
+            if (($userPath -split ';').TrimEnd('\') -notcontains $realDir.TrimEnd('\')) { throw 'Binary directory missing from persisted user PATH' }
+            if ($resolved -ne $realExe -or $where[0] -ne $realExe) { throw 'Command did not resolve directly to the installed executable' }
+            if (Test-Path $link) { throw 'Fixed install unexpectedly created a Links entry' }
+          } else {
+            if ($resolved -ne $link) { throw 'Baseline did not resolve via WinGet Links' }
+            if ((Get-Item $link).LinkType -ne 'SymbolicLink') { throw 'Baseline Links entry is not a symbolic link' }
+          }
+
+          $work = Join-Path $env:RUNNER_TEMP "sing-box-cronet-$version-$variant"
+          New-Item $work -ItemType Directory -Force | Out-Null
+          $config = Join-Path $work 'naive-test.json'
+          # Loopback and dummy credentials only; no inbound, traffic, or external proxy is used.
+          @{
+            log = @{ level = 'info' }
+            outbounds = @(@{
+              type = 'naive'; tag = 'naive-test'; server = '127.0.0.1'; server_port = 443
+              username = 'ci-dummy'; password = 'ci-dummy-not-a-secret'
+              tls = @{ enabled = $true; server_name = 'example.invalid' }
+            })
+          } | ConvertTo-Json -Depth 8 | Set-Content $config -Encoding utf8
+          Push-Location $work
+          try {
+            $directOutput = (& $realExe check -c $config 2>&1 | Out-String)
+            $directExit = $LASTEXITCODE
+            Write-Output "Direct check exit: $directExit`n$directOutput"
+            if ($directExit -ne 0) { throw 'Direct executable check failed' }
+            $commandOutput = (sing-box.exe check -c $config 2>&1 | Out-String)
+            $commandExit = $LASTEXITCODE
+            Write-Output "PATH command check exit: $commandExit`n$commandOutput"
+            if ($variant -eq 'baseline') {
+              if ($commandExit -eq 0 -or $commandOutput -notmatch 'cronet: library not found') { throw 'Baseline did not reproduce the expected Cronet lookup error' }
+            } elseif ($commandExit -ne 0) {
+              throw 'Fixed PATH command check failed'
+            }
+
+            # Inspect a live process to prove which DLL Windows actually loaded.
+            $probeExe = if ($variant -eq 'fixed') { 'sing-box.exe' } else { $realExe }
+            $process = Start-Process $probeExe -ArgumentList @('run', '-c', "`"$config`"") -WorkingDirectory $work -RedirectStandardOutput (Join-Path $work 'run.stdout.txt') -RedirectStandardError (Join-Path $work 'run.stderr.txt') -PassThru
+            try {
+              $loadedDll = $null
+              for ($attempt = 0; $attempt -lt 20; $attempt++) {
+                Start-Sleep -Milliseconds 500
+                if ($process.HasExited) { throw "Probe exited prematurely with $($process.ExitCode)" }
+                $loadedDll = @((Get-Process -Id $process.Id).Modules | Where-Object ModuleName -eq 'libcronet.dll' | Select-Object -ExpandProperty FileName)
+                if ($loadedDll.Count -gt 0) { break }
+              }
+              if ($loadedDll.Count -ne 1 -or $loadedDll[0] -ne $dll) { throw "Expected installed libcronet.dll, got: $loadedDll" }
+              Write-Output "Loaded module: $($loadedDll[0])"
+            } finally {
+              if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            }
+            $result = [ordered]@{
+              version = $version; variant = $variant; runner = $env:RUNNER_OS; architecture = 'x64'; scope = 'user'
+              manifestValidation = 'passed'; install = 'passed'; persistedUserPath = $userPath
+              resolvedCommand = $resolved; where = $where; realExecutable = $realExe
+              directCheckExit = $directExit; pathCheckExit = $commandExit
+              pathCheckOutput = $commandOutput.Trim(); loadedDll = $loadedDll[0]
+            }
+            $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $work 'result.json')
+            "## $version / $variant - PASS`n- Manifest validation and installation passed (x64, user scope).`n- Direct check exit: $directExit`n- PATH command check exit: $commandExit`n- Loaded DLL: ``$($loadedDll[0])```n" >> $env:GITHUB_STEP_SUMMARY
+          } finally {
+            Pop-Location
+          }
+          # The baseline check's expected exit 1 must not become the Actions step status.
+          exit 0
+      - name: Preserve isolated test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sing-box-cronet-${{ matrix.version }}-${{ matrix.variant }}
+          path: ${{ runner.temp }}/sing-box-cronet-${{ matrix.version }}-${{ matrix.variant }}/
+          if-no-files-found: warn
+          retention-days: 14
