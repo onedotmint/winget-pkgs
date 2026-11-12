@@ -149,6 +149,8 @@ jobs:
           } finally {
             Pop-Location
           }
+          # The baseline check's expected exit 1 must not become the Actions step status.
+          exit 0
       - name: Preserve isolated test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
