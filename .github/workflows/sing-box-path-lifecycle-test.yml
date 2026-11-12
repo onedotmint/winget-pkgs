@@ -1,0 +1,197 @@
+name: sing-box WinGet PATH lifecycle regression
+
+on:
+  push:
+    branches:
+      - test/sing-box-path-lifecycle
+    paths:
+      - .github/workflows/sing-box-path-lifecycle-test.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - baseline-uninstall
+          - fixed-uninstall
+          - symlink-to-path-upgrade
+          - path-to-path-upgrade
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: manifests/s/SagerNet/sing-box
+      - name: Prepare WinGet on disposable runner
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Get-AppxPackage Microsoft.DesktopAppInstaller)) {
+            Install-Module Microsoft.WinGet.Client -Repository PSGallery -Scope CurrentUser -Force
+            Import-Module Microsoft.WinGet.Client
+            Repair-WinGetPackageManager -AllUsers -Force -Latest
+          }
+          $app = Get-AppxPackage Microsoft.DesktopAppInstaller
+          if (-not $app) { throw 'WinGet App Installer is unavailable' }
+          $winget = Join-Path $app.InstallLocation 'winget.exe'
+          & $winget --info
+          if ($LASTEXITCODE -ne 0) { throw 'winget --info failed' }
+          & $winget settings --enable LocalManifestFiles
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot enable local manifests' }
+          "WINGET_EXE=$winget" >> $env:GITHUB_ENV
+      - name: Test install, upgrade, uninstall and persisted PATH
+        env:
+          TEST_SCENARIO: ${{ matrix.scenario }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $scenario = $env:TEST_SCENARIO
+          $evidence = Join-Path $env:RUNNER_TEMP "sing-box-lifecycle-$scenario"
+          New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+          $report = [ordered]@{
+            scenario = $scenario
+            runner = $env:RUNNER_OS
+            scope = 'user'
+            architecture = 'x64'
+            stages = [System.Collections.Generic.List[object]]::new()
+            result = 'NOT_FINISHED'
+          }
+          function Invoke-Winget {
+            param([string[]] $CommandArgs)
+            Write-Output ("winget " + ($CommandArgs -join ' '))
+            & $env:WINGET_EXE @CommandArgs
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0) { throw "winget failed with exit code $exitCode" }
+          }
+          function New-TestManifest {
+            param([string] $Version, [bool] $PathMode)
+            $source = Join-Path $env:GITHUB_WORKSPACE "manifests/s/SagerNet/sing-box/$Version"
+            $destination = Join-Path $evidence "manifest-$Version-$PathMode"
+            Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+            $installer = Join-Path $destination 'SagerNet.sing-box.installer.yaml'
+            $text = [IO.File]::ReadAllText($installer)
+            $text = [regex]::Replace($text, '(?m)^ArchiveBinariesDependOnPath: true\r?\n', '')
+            if ($PathMode) {
+              $match = 'NestedInstallerType: portable'
+              if (-not $text.Contains($match)) { throw 'Expected nested portable manifest' }
+              $text = $text.Replace($match, $match + [Environment]::NewLine + 'ArchiveBinariesDependOnPath: true')
+            }
+            [IO.File]::WriteAllText($installer, $text, [Text.UTF8Encoding]::new($false))
+            Invoke-Winget @('validate', '--manifest', $destination, '--disable-interactivity')
+            return $destination
+          }
+          function Read-UserPath {
+            return [Environment]::GetEnvironmentVariable('Path', 'User')
+          }
+          function Refresh-Path {
+            $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            $user = Read-UserPath
+            $env:Path = "$machine;$user"
+          }
+          function Has-UserPath {
+            param([string] $Directory)
+            $entries = @((Read-UserPath -split ';') | ForEach-Object { $_.TrimEnd('\') })
+            return $entries -contains $Directory.TrimEnd('\')
+          }
+          function Get-InstalledExe {
+            param([string] $Version)
+            $root = Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Packages'
+            $items = @(Get-ChildItem -LiteralPath $root -Filter sing-box.exe -File -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -like "*sing-box-$Version-windows-amd64*" })
+            if ($items.Count -ne 1) { throw "Expected one real EXE for $Version, found $($items.Count)" }
+            return $items[0].FullName
+          }
+          function Snapshot {
+            param([string] $Stage)
+            Refresh-Path
+            $userPath = Read-UserPath
+            $where = @(where.exe sing-box.exe 2>$null)
+            $link = Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Links/sing-box.exe'
+            $snapshot = [ordered]@{
+              stage = $Stage
+              userPath = $userPath
+              executableCandidates = $where
+              linkExists = Test-Path $link
+              packageDirectories = @(Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Packages') -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+            }
+            $report.stages.Add($snapshot)
+            Write-Output ("SNAPSHOT " + ($snapshot | ConvertTo-Json -Compress -Depth 5))
+          }
+          function Assert-CommandMode {
+            param([string] $Version, [bool] $PathMode)
+            Refresh-Path
+            $exe = Get-InstalledExe $Version
+            $directory = Split-Path $exe
+            $resolved = (Get-Command sing-box.exe -CommandType Application).Source
+            $link = Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Links/sing-box.exe'
+            if ($PathMode) {
+              if (-not (Has-UserPath $directory)) { throw "Expected real binary directory in PATH: $directory" }
+              if ($resolved -ne $exe) { throw "Expected real EXE via PATH; got $resolved" }
+              if (-not (Test-Path (Join-Path $directory 'libcronet.dll'))) { throw 'Missing libcronet.dll' }
+            } else {
+              if ($resolved -ne $link) { throw "Expected WinGet Links symlink; got $resolved" }
+              if ((Get-Item $link).LinkType -ne 'SymbolicLink') { throw 'Expected symlink' }
+            }
+            return $directory
+          }
+          try {
+            Snapshot 'initial'
+            $fixed = New-TestManifest '1.14.4' $true
+            $baseline = New-TestManifest '1.14.4' $false
+            if ($scenario -eq 'baseline-uninstall') {
+              Invoke-Winget @('install', '--manifest', $baseline, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              $oldDir = Assert-CommandMode '1.14.4' $false
+              Snapshot 'baseline-installed'
+            } elseif ($scenario -eq 'fixed-uninstall') {
+              Invoke-Winget @('install', '--manifest', $fixed, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              $oldDir = Assert-CommandMode '1.14.4' $true
+              Snapshot 'fixed-installed'
+            } elseif ($scenario -eq 'symlink-to-path-upgrade' -or $scenario -eq 'path-to-path-upgrade') {
+              $oldUsesPath = ($scenario -eq 'path-to-path-upgrade')
+              $old = New-TestManifest '1.14.3' $oldUsesPath
+              Invoke-Winget @('install', '--manifest', $old, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              $oldDir = Assert-CommandMode '1.14.3' $oldUsesPath
+              Snapshot '1.14.3-installed'
+              Invoke-Winget @('upgrade', '--manifest', $fixed, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              $newDir = Assert-CommandMode '1.14.4' $true
+              Snapshot 'upgraded-to-1.14.4'
+              if ($oldUsesPath -and (Has-UserPath $oldDir)) { throw "Old 1.14.3 PATH entry remained after upgrade: $oldDir" }
+              $link = Join-Path $env:LOCALAPPDATA 'Microsoft/WinGet/Links/sing-box.exe'
+              if (Test-Path $link) { throw "Old symlink survived upgrade: $link" }
+            } else {
+              throw "Unknown test scenario: $scenario"
+            }
+            Invoke-Winget @('uninstall', '--id', 'SagerNet.sing-box', '--exact', '--silent', '--accept-source-agreements', '--disable-interactivity')
+            Snapshot 'uninstalled'
+            if (Has-UserPath $oldDir) { throw "Old package PATH entry remained after uninstall: $oldDir" }
+            if ($newDir -and (Has-UserPath $newDir)) { throw "New package PATH entry remained after uninstall: $newDir" }
+            $after = @(where.exe sing-box.exe 2>$null)
+            if ($after.Count -ne 0) { throw "sing-box.exe still resolved after uninstall: $($after -join ', ')" }
+            $report.result = 'PASS'
+            "## $scenario : PASS" >> $env:GITHUB_STEP_SUMMARY
+          } catch {
+            $report.result = 'FAIL'
+            $report.error = $_.ToString()
+            "## $scenario : FAIL" >> $env:GITHUB_STEP_SUMMARY
+            Write-Error "PATH lifecycle test failed: $_"
+            throw
+          } finally {
+            $report | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $evidence 'result.json') -Encoding utf8
+          }
+      - name: Preserve lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sing-box-lifecycle-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/sing-box-lifecycle-${{ matrix.scenario }}/result.json
+          if-no-files-found: warn
+          retention-days: 14
