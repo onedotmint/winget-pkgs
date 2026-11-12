@@ -67,8 +67,8 @@ jobs:
           }
           function Invoke-Winget {
             param([string[]] $CommandArgs)
-            Write-Output ("winget " + ($CommandArgs -join ' '))
-            & $env:WINGET_EXE @CommandArgs
+            Write-Host ("winget " + ($CommandArgs -join ' '))
+            & $env:WINGET_EXE @CommandArgs | Out-Host
             $exitCode = $LASTEXITCODE
             if ($exitCode -ne 0) { throw "winget failed with exit code $exitCode" }
           }
@@ -86,7 +86,7 @@ jobs:
               $text = $text.Replace($match, $match + [Environment]::NewLine + 'ArchiveBinariesDependOnPath: true')
             }
             [IO.File]::WriteAllText($installer, $text, [Text.UTF8Encoding]::new($false))
-            Invoke-Winget @('validate', '--manifest', $destination, '--disable-interactivity')
+            Invoke-Winget -CommandArgs @('validate', '--manifest', $destination, '--disable-interactivity')
             return $destination
           }
           function Read-UserPath {
@@ -148,20 +148,20 @@ jobs:
             $fixed = New-TestManifest '1.14.4' $true
             $baseline = New-TestManifest '1.14.4' $false
             if ($scenario -eq 'baseline-uninstall') {
-              Invoke-Winget @('install', '--manifest', $baseline, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              Invoke-Winget -CommandArgs @('install', '--manifest', $baseline, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
               $oldDir = Assert-CommandMode '1.14.4' $false
               Snapshot 'baseline-installed'
             } elseif ($scenario -eq 'fixed-uninstall') {
-              Invoke-Winget @('install', '--manifest', $fixed, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              Invoke-Winget -CommandArgs @('install', '--manifest', $fixed, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
               $oldDir = Assert-CommandMode '1.14.4' $true
               Snapshot 'fixed-installed'
             } elseif ($scenario -eq 'symlink-to-path-upgrade' -or $scenario -eq 'path-to-path-upgrade') {
               $oldUsesPath = ($scenario -eq 'path-to-path-upgrade')
               $old = New-TestManifest '1.14.3' $oldUsesPath
-              Invoke-Winget @('install', '--manifest', $old, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              Invoke-Winget -CommandArgs @('install', '--manifest', $old, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
               $oldDir = Assert-CommandMode '1.14.3' $oldUsesPath
               Snapshot '1.14.3-installed'
-              Invoke-Winget @('upgrade', '--manifest', $fixed, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+              Invoke-Winget -CommandArgs @('upgrade', '--manifest', $fixed, '--architecture', 'x64', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
               $newDir = Assert-CommandMode '1.14.4' $true
               Snapshot 'upgraded-to-1.14.4'
               if ($oldUsesPath -and (Has-UserPath $oldDir)) { throw "Old 1.14.3 PATH entry remained after upgrade: $oldDir" }
@@ -170,7 +170,7 @@ jobs:
             } else {
               throw "Unknown test scenario: $scenario"
             }
-            Invoke-Winget @('uninstall', '--id', 'SagerNet.sing-box', '--exact', '--silent', '--accept-source-agreements', '--disable-interactivity')
+            Invoke-Winget -CommandArgs @('uninstall', '--id', 'SagerNet.sing-box', '--exact', '--silent', '--accept-source-agreements', '--disable-interactivity')
             Snapshot 'uninstalled'
             if (Has-UserPath $oldDir) { throw "Old package PATH entry remained after uninstall: $oldDir" }
             if ($newDir -and (Has-UserPath $newDir)) { throw "New package PATH entry remained after uninstall: $newDir" }
